@@ -125,6 +125,17 @@ internal static class Prj
     [DllImport("ProjectedFSLib.dll")]
     public static extern void PrjFreeAlignedBuffer(IntPtr buffer);
 
+    // Must be called once on the virtroot directory before PrjStartVirtualizing.
+    // Pass null for targetPathName to mark rootPathName itself as the virt root.
+    // versionInfo may be IntPtr.Zero; virtualizationInstanceID identifies this
+    // provider instance and is embedded in the NTFS reparse point.
+    [DllImport("ProjectedFSLib.dll", CharSet = CharSet.Unicode)]
+    public static extern int PrjMarkDirectoryAsPlaceholder(
+        string   rootPathName,
+        string   targetPathName,
+        IntPtr   versionInfo,
+        ref Guid virtualizationInstanceID);
+
     [DllImport("ProjectedFSLib.dll", CharSet = CharSet.Unicode)]
     public static extern int PrjFillDirEntryBuffer(
         string            fileName,
@@ -199,6 +210,11 @@ internal static class Prj
         for (int i = 0; i < 4; i++) b[o + i] = (byte)(v >> (i * 8));
     }
 
+    // HRESULT_FROM_WIN32(ERROR_NOT_A_REPARSE_POINT) – returned by PrjStartVirtualizing
+    // when the virtroot has not been stamped with PrjMarkDirectoryAsPlaceholder yet,
+    // or when stale placeholder files from a previous session remain in the directory.
+    public const int HR_NOT_A_REPARSE_POINT = unchecked((int)0x80071126);
+
     public static string Hr(int hr)
     {
         switch (hr)
@@ -207,6 +223,7 @@ internal static class Prj
             case HR_FILE_NOT_FOUND:      return "FileNotFound";
             case HR_PATH_NOT_FOUND:      return "PathNotFound";
             case HR_INSUFFICIENT_BUFFER: return "InsufficientBuffer";
+            case HR_NOT_A_REPARSE_POINT: return "NotAReparsePoint";
             case E_FAIL:                 return "InternalError";
             default:                     return "0x" + ((uint)hr).ToString("X8");
         }
@@ -637,7 +654,15 @@ internal static class Program
         if (hr != Prj.S_OK)
         {
             Console.Error.WriteLine("PrjStartVirtualizing failed: " + Prj.Hr(hr));
-            Console.Error.WriteLine("Ensure Client-ProjFS is enabled and this process is elevated.");
+            if (hr == Prj.HR_NOT_A_REPARSE_POINT)
+            {
+                Console.Error.WriteLine("The virtroot could not be marked as a ProjFS root.");
+                Console.Error.WriteLine("Try deleting it manually:  rmdir /s /q \"" + Path.GetFullPath(virtRoot) + "\"");
+            }
+            else
+            {
+                Console.Error.WriteLine("Ensure Client-ProjFS is enabled and this process is elevated.");
+            }
             return 1;
         }
 
@@ -716,6 +741,40 @@ internal sealed class SimpleProvider
     public int StartVirtualizing()
     {
         _current = this;
+
+        // Always start with a clean, empty virtroot.
+        //
+        // PrjStartVirtualizing returns 0x80071126 (ERROR_NOT_A_REPARSE_POINT) in
+        // two situations:
+        //   1. The directory has never been marked as a ProjFS virtualization root
+        //      (PrjMarkDirectoryAsPlaceholder has not been called on it yet).
+        //   2. The directory contains stale placeholder files or a leftover reparse
+        //      point from a previous session that did not call PrjStopVirtualizing.
+        //
+        // Deleting and recreating the directory solves both cases.
+        if (Directory.Exists(_virtRoot))
+        {
+            Console.WriteLine("Clearing previous virtroot: " + _virtRoot);
+            try { Directory.Delete(_virtRoot, true); }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("[WARN] Could not fully clear virtroot: " + ex.Message);
+            }
+        }
+        Directory.CreateDirectory(_virtRoot);
+
+        // Stamp the empty directory with the ProjFS NTFS reparse point.
+        // This is a prerequisite for PrjStartVirtualizing and only needs to be
+        // done once per directory lifetime.  Because we recreate the directory
+        // above, we must call this on every run.
+        Guid instanceId = Guid.NewGuid();
+        int markHr = Prj.PrjMarkDirectoryAsPlaceholder(
+            _virtRoot, null, IntPtr.Zero, ref instanceId);
+        if (markHr != Prj.S_OK)
+        {
+            Console.Error.WriteLine("PrjMarkDirectoryAsPlaceholder failed: " + Prj.Hr(markHr));
+            return markHr;
+        }
 
         Prj.Callbacks cbs = new Prj.Callbacks();
         cbs.StartDirEnum       = Marshal.GetFunctionPointerForDelegate(_cbStartDirEnum);
