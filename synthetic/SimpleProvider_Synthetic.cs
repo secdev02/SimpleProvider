@@ -28,6 +28,8 @@
 //
 // NOTE: Written in C# 5 syntax for compatibility with the .NET Framework 4.x
 //       csc.exe at C:\Windows\Microsoft.NET\Framework64\v4.0.30319\.
+//       The namespace for synthetic classes is "Synthetic" (not "SimpleProvider.Synthetic")
+//       to avoid a C# name collision between the namespace prefix and the SimpleProvider class.
 
 using System;
 using System.Collections.Concurrent;
@@ -36,12 +38,12 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Xml;
-using SimpleProvider.Synthetic;
+using Synthetic;
 
 // =============================================================================
-// Synthetic virtual file system  (namespace: SimpleProvider.Synthetic)
+// Synthetic virtual file system  (namespace: Synthetic)
 // =============================================================================
-namespace SimpleProvider.Synthetic
+namespace Synthetic
 {
     // -------------------------------------------------------------------------
     // SyntheticEntry  – one row from the CSV after normalisation.
