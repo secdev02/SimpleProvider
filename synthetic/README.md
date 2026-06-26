@@ -1,18 +1,41 @@
 # SimpleProvider – Synthetic Data
 
-The `--syntheticdata` flag extends the provider with a virtual file system layer defined by a CSV file. Synthetic entries are mixed into the real source directory projection, appearing alongside genuine files in the virt root without any real files backing them.
-
-This is useful for showcasing ProjFS with a controlled, reproducible layout — for example, projecting a convincing set of credential files to demonstrate that a security scanner or backup tool picks them up, without exposing any real secrets.
+The `--syntheticdata` and `--syntheticonly` flags extend the provider with a virtual file system layer defined by a plain CSV file.  Synthetic entries appear alongside (or instead of) real source files without any real data backing them.
 
 ---
 
 ## Quick start
 
 ```
+# Mix real + synthetic
 SimpleProvider.exe --sourceroot C:\EmptyOrRealDir --virtroot C:\Virt --syntheticdata entries.csv
+
+# Synthetic only – no real source directory needed
+SimpleProvider.exe --virtroot C:\Virt --syntheticdata entries.csv --syntheticonly
 ```
 
-`--sourceroot` is still required. It can be an empty directory if you only want synthetic content.
+---
+
+## Compile
+
+`System.Xml.dll` is now required (used to read the content templates from the app config):
+
+```
+csc.exe /platform:x64 /r:System.Xml.dll /out:SimpleProvider.exe SimpleProvider.cs
+```
+
+---
+
+## Flags
+
+| Flag | Required | Description |
+|---|---|---|
+| `--sourceroot <path>` | Required unless `--syntheticonly` | Directory whose real files are projected |
+| `--virtroot <path>` | Always required | Directory where the projection appears |
+| `--syntheticdata <csv>` | Required for synthetic features | CSV file defining the virtual layout |
+| `--syntheticonly` | Optional | Serve only synthetic content; real source is ignored entirely |
+
+`--syntheticonly` requires `--syntheticdata`.
 
 ---
 
@@ -32,195 +55,161 @@ SimpleProvider.exe --sourceroot C:\EmptyOrRealDir --virtroot C:\Virt --synthetic
 |---|---|---|
 | `\Path\To\Entry` | string | Path relative to the virt root. Must start with `\`. Backslash separators. |
 | `isDirectory` | `true` / `false` | Whether the entry is a directory. |
-| `fileSize` | integer (bytes) | Reported size of the file. Ignored for directories (use `0`). |
-| `unixTimestamp` | integer (seconds) | Unix epoch timestamp applied to all four NTFS timestamps: Created, Accessed, Written, Changed. |
+| `fileSize` | integer (bytes) | Reported size of the file. Use `0` for directories. |
+| `unixTimestamp` | integer | Unix epoch seconds applied to all four NTFS timestamps. |
 
-Paths **must be declared top-down**: a parent directory must appear in the CSV before its children, otherwise the parent directory will exist without a corresponding entry and `GetPlaceholderInfoCallback` will fall through to the real source (which may not exist).
-
----
-
-## The included `entries.csv`
-
-The provided example projects a realistic-looking credential tree:
-
-```
-C:\Virt\
-├── AWS\
-│   ├── credentials
-│   ├── config
-│   ├── iam_access_keys.csv
-│   └── s3_bucket_policy.json
-├── SSH Keys\
-│   ├── id_rsa
-│   ├── id_rsa.pub
-│   ├── id_ed25519
-│   ├── id_ed25519.pub
-│   ├── authorized_keys
-│   └── deploy_key.pem
-└── API Keys\
-    ├── api_keys.json
-    ├── github_pat.txt
-    └── stripe_keys.txt
-```
-
-All values in these files are well-known AWS documentation examples or obviously synthetic placeholders (`AKIAIOSFODNN7EXAMPLE`, `sk-EXAMPLE…`). No real credentials are involved.
+Paths must be declared top-down: a parent directory must appear before its children.
 
 ---
 
-## Content generation
+## Content templates – `SimpleProvider.exe.config`
 
-When a process reads a synthetic file, `SyntheticContent.Generate` produces content matched to the filename. The content is then trimmed or padded with newlines to land on exactly `fileSize` bytes as declared in the CSV.
+File content returned when a synthetic file is read is defined entirely in the config file, not in the source code.  **No recompile is needed to change templates.**
 
-### Recognised filenames (exact, case-insensitive)
+### File placement
 
-| Filename | Content produced |
+The config file must be in the same directory as the exe, named `<your-exe-name>.exe.config`:
+
+```
+SimpleProvider.exe
+SimpleProvider.exe.config   ← templates live here
+entries.csv
+```
+
+If the exe is renamed (e.g. to `SimpleProvider_Synthetic.exe`), rename the config to match:
+
+```
+SimpleProvider_Synthetic.exe
+SimpleProvider_Synthetic.exe.config
+```
+
+### Template element attributes
+
+| Attribute | Value | Description |
+|---|---|---|
+| `name` | filename (case-insensitive) | Exact filename match, e.g. `credentials`, `id_rsa.pub` |
+| `extension` | file extension | Fallback when no exact name matches, e.g. `.pem`, `.json` |
+| `type` | `"pem"` | Generate a deterministic LCG base64 PEM block scaled to `fileSize` |
+| `pemLabel` | string | Text inside `-----BEGIN ... -----` (only used with `type="pem"`) |
+| CDATA body | text | Static template; trimmed of whitespace then padded/truncated to `fileSize` |
+
+### Lookup order
+
+```
+1. Exact filename match  (name="credentials")
+2. Extension fallback    (extension=".json")
+3. Built-in generic text (# filename / synthetic comment)
+```
+
+### Adding a new template
+
+Open `SimpleProvider.exe.config` and add a `<template>` element inside `<syntheticTemplates>`:
+
+```xml
+<!-- Static text template matched by exact filename -->
+<template name="vault_token"><![CDATA[
+# HashiCorp Vault token
+VAULT_TOKEN=hvs.EXAMPLE1234567890abcdefghijklmnopqrstuvwxyz
+VAULT_ADDR=https://vault.example.com:8200
+]]></template>
+
+<!-- PEM block sized to the fileSize declared in the CSV -->
+<template name="service_account.pem" type="pem" pemLabel="EC PRIVATE KEY" />
+
+<!-- Extension fallback for any unmatched .yaml file -->
+<template extension=".yaml"><![CDATA[
+synthetic: true
+generator: SimpleProvider
+]]></template>
+```
+
+Restart the provider to pick up changes.
+
+### CDATA whitespace
+
+The XML parser includes a leading newline before the CDATA content.  `SyntheticContent.LoadFromConfig` trims leading and trailing whitespace from the node text before appending one `\n`, so the template starts and ends cleanly regardless of how it is indented in the XML file.
+
+---
+
+## Namespace: `SimpleProvider.Synthetic`
+
+The three supporting classes live in the `SimpleProvider.Synthetic` namespace:
+
+| Class | Responsibility |
 |---|---|
-| `credentials` | AWS INI credentials block (`[default]`, `aws_access_key_id`, `aws_secret_access_key`) |
-| `config` | AWS INI config block (default + staging + prod profiles) |
-| `iam_access_keys.csv` | CSV with header row + two IAM key rows |
-| `s3_bucket_policy.json` | Three-statement S3 bucket policy JSON |
-| `id_rsa` | `-----BEGIN RSA PRIVATE KEY-----` PEM block sized to `fileSize` |
-| `id_rsa.pub` | `ssh-rsa AAAA…` public key line |
-| `id_ed25519` | `-----BEGIN OPENSSH PRIVATE KEY-----` PEM block sized to `fileSize` |
-| `id_ed25519.pub` | `ssh-ed25519 AAAA…` public key line |
-| `authorized_keys` | Four `ssh-rsa` / `ssh-ed25519` public key entries |
-| `deploy_key.pem` | `-----BEGIN RSA PRIVATE KEY-----` PEM block sized to `fileSize` |
-| `api_keys.json` | JSON object with OpenAI, SendGrid, Twilio, PagerDuty key blocks |
-| `github_pat.txt` | `ghp_EXAMPLE…` token + created date + scope list |
-| `stripe_keys.txt` | Publishable, secret, restricted, and webhook keys in plain text |
+| `SyntheticEntry` | One row from the CSV after path normalisation. `GetFiletime()` converts the Unix timestamp to a Windows FILETIME. |
+| `SyntheticData` | Loads and indexes the CSV at startup. Two internal dictionaries (`_byPath` for placeholder lookups, `_byParent` for directory listing) both use case-insensitive comparison. |
+| `SyntheticContent` | Generates file content at read time. `LoadFromConfig(path)` parses the XML config. `Generate(name, size)` resolves the template and trims/pads to the exact declared size. |
 
-### Extension fallbacks (when filename is not recognised)
-
-| Extension | Content produced |
-|---|---|
-| `.pem` | Generic `-----BEGIN PRIVATE KEY-----` PEM block sized to `fileSize` |
-| `.json` | Minimal `{ "synthetic": true }` JSON |
-| `.csv` | Three-column header + one data row |
-| anything else | `# <filename>` comment header |
-
-### PEM size scaling
-
-PEM files (`id_rsa`, `id_ed25519`, `deploy_key.pem`, `*.pem`) use a deterministic LCG to fill the base64 body to approximately `fileSize` bytes. The generator subtracts the header and footer lengths from `fileSize` to decide how much base64 to emit, so the resulting PEM always looks correctly proportioned for the declared key size regardless of what `fileSize` is set to in the CSV.
-
-The LCG seed is fixed (`0x12345678`), so every provider run generates identical content for identical inputs. This makes the projection reproducible and diff-stable.
+These classes are isolated from the P/Invoke layer (`Prj`) and the provider logic (`SimpleProvider`) so the synthetic subsystem can be read, tested, or replaced independently.
 
 ---
 
 ## Mixing: real vs synthetic priority
 
-When a directory contains both real files from `--sourceroot` and synthetic entries from the CSV, the two are merged during `StartDirectoryEnumerationCallback`:
+When `--syntheticonly` is **not** set, real and synthetic entries are merged during `StartDirectoryEnumerationCallback`:
+
+| Rule | Behaviour |
+|---|---|
+| Listing | Real and synthetic entries are merged and sorted case-insensitively |
+| Name conflict | Real file always wins; synthetic entry with the same name is silently dropped |
+| Placeholder | Real source checked first; synthetic entry used only if no real file/dir exists |
+| File data | Real source checked first; synthetic content served only if real file absent |
+
+When `--syntheticonly` **is** set, all real-source code paths are skipped entirely:
 
 ```
-Real source          Synthetic CSV           Merged listing
-─────────────────    ─────────────────       ─────────────────
-notes.txt            credentials             API Keys\       (synth)
-project\             id_rsa                  credentials     (synth)
-                                             id_rsa          (synth)
-                                             notes.txt       (real)
-                                             project\        (real)
+OnStartDirEnum        → only adds synthetic children
+OnGetPlaceholderInfo  → only writes synthetic placeholder
+OnGetFileData         → only calls ServeSyntheticContent
 ```
-
-**Real files take priority.** If a real file and a synthetic entry share the same name in the same directory, the real file wins and the synthetic entry is silently dropped from the listing. The same rule applies in `GetPlaceholderInfoCallback` and `GetFileDataCallback`: the provider checks the real source first and only falls through to synthetic content if nothing is found on disk.
 
 ---
 
-## Console output with synthetic entries
-
-Synthetic files produce the same callback log lines as real files. The only visual difference is the `[synthetic]` tag on the exit lines:
+## Console output
 
 ```
-[14:03:11 INF] ----> StartDirectoryEnumerationCallback Path []
-[14:03:11 INF] <---- StartDirectoryEnumerationCallback Ok
-[14:03:11 INF] ----> GetDirectoryEnumerationCallback filterFileName []
-[14:03:11 INF] <---- GetDirectoryEnumerationCallback Ok [Added entries: 3]
+Loaded 15 content templates from config.
+Loaded synthetic data: .\entries.csv
+Clearing previous virtroot: C:\FakeFiles
+Provider running.
+  Virt      : C:\FakeFiles
+  Synthetic : C:\entries.csv
+  Mode      : synthetic only (no real source)
+```
+
+```
 [14:03:12 INF] ----> GetPlaceholderInfoCallback [AWS]
 [14:03:12 INF]   Placeholder creation triggered by [\Device\...\explorer.exe 9812]
 [14:03:12 INF] <---- GetPlaceholderInfoCallback Ok [synthetic]
-[14:03:13 INF] ----> StartDirectoryEnumerationCallback Path [AWS]
-[14:03:13 INF] <---- StartDirectoryEnumerationCallback Ok
-[14:03:13 INF] ----> GetDirectoryEnumerationCallback filterFileName []
-[14:03:13 INF] <---- GetDirectoryEnumerationCallback Ok [Added entries: 4]
-[14:03:14 INF] ----> GetPlaceholderInfoCallback [AWS\credentials]
-[14:03:14 INF]   Placeholder creation triggered by [\Device\...\powershell.exe 6444]
-[14:03:14 INF] <---- GetPlaceholderInfoCallback Ok [synthetic]
 [14:03:14 INF] ----> GetFileDataCallback relativePath [AWS\credentials]
 [14:03:14 INF]   triggered by [\Device\...\powershell.exe 6444]
 [14:03:14 INF] <---- return status Ok [synthetic]
 ```
 
----
-
-## How the three new classes work
-
-### `SyntheticEntry`
-
-Plain data class. Holds one row from the CSV after normalisation: the leading `\` is stripped from the path, and `Name` / `ParentPath` are split out for fast lookup. `GetFiletime()` converts the Unix timestamp to a Windows FILETIME for use in `PrjWritePlaceholderInfo`.
-
-### `SyntheticData`
-
-Built once at startup from `SyntheticData.Load(path)`. Maintains two dictionaries:
-
-- `_byPath` — keyed by `RelativePath`, used in `GetPlaceholderInfoCallback` and `GetFileDataCallback` to check whether a given path is synthetic.
-- `_byParent` — keyed by `ParentPath`, used in `StartDirectoryEnumerationCallback` to find all synthetic children of a directory being listed.
-
-Both dictionaries use case-insensitive comparison, matching ProjFS's own case-insensitive path handling.
-
-### `SyntheticContent`
-
-Stateless static class. `Generate(fileName, declaredSize)` selects a template by filename (exact match first, extension fallback second), encodes it as UTF-8, then calls `FitToSize` to trim or pad with `\n` characters to exactly `declaredSize` bytes. PEM files bypass the static templates and use `PemBlock()` + `FakeBase64()` to produce correctly proportioned base64 bodies at any declared size.
+The `[synthetic]` tag on exit lines makes it easy to distinguish synthetic callbacks from real ones.
 
 ---
 
-## `DirEntry` struct – the unified listing type
+## Troubleshooting
 
-Internally, `EnumerationSession` used to store `FileSystemInfo[]` (real entries only). It now stores a `DirEntry[]` that holds one entry regardless of origin:
-
+**`PrjStartVirtualizing` returns `0x80071126` (NotAReparsePoint)**
+The provider now automatically clears and recreates the virtroot on every start to avoid this.  If it persists, delete the directory manually:
 ```
-DirEntry
-├── Name            string
-├── IsSynthetic     bool
-├── IsDirectory     bool
-├── FileSize        long
-├── CreationTimeFt  long   (Windows FILETIME)
-├── LastAccessTimeFt long
-├── LastWriteTimeFt  long
-└── FileAttributes  uint
+rmdir /s /q C:\FakeFiles
 ```
 
-`OnStartDirEnum` builds this list by converting real `FileSystemInfo` objects via `RealToDirEntry` and synthetic entries via `SyntheticToDirEntry`, then sorting the merged list. `OnGetDirEnum` reads from the same struct regardless of origin, so `PrjFillDirEntryBuffer` sees a single consistent code path for both real and synthetic entries.
+**`[INFO] Config not found`**
+The config file is missing or misnamed.  Check that `<exe-name>.exe.config` is in the same directory as the exe.
 
----
+**`[INFO] No <syntheticTemplates> section found in config`**
+The config file exists but the XML structure is wrong.  Check that the root is `<configuration>` and the child is `<syntheticTemplates>`.
 
-## Adding new content templates
+**Synthetic file content is just `# filename ...`**
+No matching `<template>` was found for that filename or extension.  Add one to the config.
 
-Open `SyntheticContent.PickTemplate` and add a `case` for the new filename, pointing to a new `private const string Tpl…` field. The `FitToSize` call in `Generate` handles any length mismatch automatically, so the template string does not need to be exactly `fileSize` bytes long.
-
-```csharp
-case "vault_token":
-    return TplVaultToken;
-```
-
-```csharp
-private const string TplVaultToken =
-    "# HashiCorp Vault token\n" +
-    "VAULT_TOKEN=hvs.EXAMPLE1234567890abcdefghijklmnopqrstuvwxyz\n" +
-    "VAULT_ADDR=https://vault.example.com:8200\n";
-```
-
-For binary or large structured files, replace the `const string` approach with a new branch in `PickTemplate` that calls a dedicated generator method instead.
-
----
-
-## Timestamps
-
-The `unixTimestamp` field is converted to a Windows FILETIME and applied to all four NTFS timestamps (Created, LastAccess, LastWrite, Change) identically. If you need files with different access and write times, add two entries with different paths and timestamps — the values are metadata only and do not affect what content is generated.
-
-To convert a human-readable date to a Unix timestamp:
-
-```powershell
-[DateTimeOffset]::Parse("2024-01-15").ToUnixTimeSeconds()
-# 1705276800
-```
+**File content is shorter/longer than expected**
+`FitToSize` pads with `\n` or truncates to hit exactly `fileSize` bytes.  Adjust `fileSize` in the CSV, or adjust the template content in the config.
 
 ---
 
@@ -228,8 +217,9 @@ To convert a human-readable date to a Unix timestamp:
 
 ```
 SimpleProviderShowcase\
-├── SimpleProvider.cs    Single source file; compile with csc.exe
-├── entries.csv          Example synthetic layout (AWS, SSH, API key tree)
-├── README.md            Core provider documentation
-└── README-synthetic.md  This file
+├── SimpleProvider.cs          Single source file
+├── SimpleProvider.exe.config  Content templates (edit without recompiling)
+├── entries.csv                Example synthetic file tree
+├── README.md                  Core provider documentation
+└── README-synthetic.md        This file
 ```
