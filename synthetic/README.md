@@ -220,10 +220,10 @@ The three supporting classes are in the `Synthetic` namespace (not `SimpleProvid
 | Class | Key methods | Responsibility |
 |---|---|---|
 | `SyntheticEntry` | `GetFiletime()` | One entry from the file list after path normalisation |
-| `SyntheticData` | `LoadFromConfig(path)`, `Load(csvPath)`, `Find(path)`, `GetChildren(parent)` | Loads and indexes the file list; two case-insensitive dictionaries (`_byPath` for placeholder lookups, `_byParent` for directory listings) |
+| `SyntheticData` | `LoadFromConfig(path)`, `Find(path)`, `GetChildren(parent)` | Loads and indexes the file list; two case-insensitive dictionaries (`_byPath` for placeholder lookups, `_byParent` for directory listings) |
 | `SyntheticContent` | `LoadFromConfig(path)`, `Generate(name, size)` | Maps filenames/extensions to templates; trims/pads to exact `fileSize` |
 
-`SyntheticData.Load(csvPath)` still exists if you want to load a standalone file programmatically. `SyntheticData.LoadFromConfig` extracts the CDATA from `<syntheticFileList>` and feeds the same `ParseLines` parser, so both sources behave identically.
+These classes are isolated from the P/Invoke layer (`Prj`) and the provider logic (`SimpleProvider`) so the synthetic subsystem can be read, tested, or replaced independently.
 
 ---
 
@@ -272,5 +272,3 @@ SimpleProviderShowcase\
 ├── README.md                      Core ProjFS provider documentation
 └── README-synthetic.md            This file
 ```
-
-The external `entries.csv` is no longer needed. The file list lives in `<syntheticFileList>` inside the config.
