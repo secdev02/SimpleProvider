@@ -67,9 +67,7 @@ namespace Synthetic
     // -------------------------------------------------------------------------
     // SyntheticData  – loads and indexes the virtual file tree.
     //
-    // Sources (in priority order when both are available):
-    //   1. LoadFromConfig  – reads <syntheticFileList> CDATA from the app config
-    //   2. Load            – reads a standalone CSV file (kept for convenience)
+    // Source: LoadFromConfig reads the <syntheticFileList> CDATA from the app config.
     //
     // Line format:  \Path\To\Entry,isDirectory,fileSize,unixTimestamp
     // -------------------------------------------------------------------------
@@ -133,13 +131,7 @@ namespace Synthetic
             get { return _byPath.Count; }
         }
 
-        // Reads a standalone CSV file (original behaviour, kept for convenience).
-        public static SyntheticData Load(string csvPath)
-        {
-            return ParseLines(File.ReadAllLines(csvPath));
-        }
-
-        // Core parser – shared by both LoadFromConfig and Load.
+        // Core parser used by LoadFromConfig.
         private static SyntheticData ParseLines(string[] lines)
         {
             SyntheticData data = new SyntheticData();
