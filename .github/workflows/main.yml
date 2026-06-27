@@ -1,0 +1,373 @@
+# ============================================================
+# test-simple-provider.yml
+#
+# Compiles SimpleProvider.cs, starts it in the background,
+# and runs a smoke test against the projected virtual root.
+# Optionally creates a GitHub Issue summarising the result.
+#
+# REQUIREMENTS
+#   - .NET Framework 4.x  (present on windows-latest by default)
+#   - Administrator privileges  (provided on GitHub-hosted runners)
+#   - ProjFS Windows feature  (enabled in step 2)
+#
+# REPO LAYOUT EXPECTED
+#   SimpleProvider.cs
+#   SimpleProvider.exe.config   (or SimpleProvider_exe.config)
+# ============================================================
+
+name: Test SimpleProvider ProjFS
+
+on:
+  workflow_dispatch:
+    inputs:
+      virt_root:
+        description: "Virtual filesystem root path"
+        required: false
+        default: 'C:\FakeFiles'
+      create_issue:
+        description: "Create a GitHub Issue with the test result"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  test:
+    name: Compile, run and smoke-test SimpleProvider
+    runs-on: windows-latest
+
+    permissions:
+      issues: write    # required for the Create issue step
+      contents: read   # required for checkout
+
+    steps:
+
+      # --------------------------------------------------------
+      # 1. Checkout
+      # --------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------------
+      # 2. Enable the ProjFS Windows optional feature.
+      #    Already on by default on windows-latest; this step
+      #    is a safety net and logs the current state clearly.
+      # --------------------------------------------------------
+      - name: Enable ProjFS
+        id: projfs
+        shell: powershell
+        run: |
+          $feat = Get-WindowsOptionalFeature -Online -FeatureName Client-ProjFS
+          Write-Host ("ProjFS state: " + $feat.State)
+
+          if ($feat.State -ne "Enabled") {
+            $result = Enable-WindowsOptionalFeature `
+                        -Online -FeatureName Client-ProjFS `
+                        -NoRestart -WarningAction SilentlyContinue
+            if ($result.RestartNeeded) {
+              Write-Error "ProjFS requires a reboot -- cannot continue on this runner."
+              exit 1
+            }
+            $feat = Get-WindowsOptionalFeature -Online -FeatureName Client-ProjFS
+            Write-Host ("ProjFS state after enable: " + $feat.State)
+          }
+
+          if ($feat.State -ne "Enabled") {
+            Write-Error "ProjFS did not reach Enabled state."
+            exit 1
+          }
+
+      # --------------------------------------------------------
+      # 3. Compile
+      # --------------------------------------------------------
+      - name: Compile SimpleProvider.cs
+        id: compile
+        shell: powershell
+        run: |
+          $csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          if (-not (Test-Path $csc)) {
+            $csc = "C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe"
+          }
+          Write-Host ("Compiler : " + $csc)
+
+          $deployDir = "C:\SimpleProvider"
+          $exeOut    = Join-Path $deployDir "SimpleProvider.exe"
+          $srcFile   = Join-Path $env:GITHUB_WORKSPACE "SimpleProvider.cs"
+
+          New-Item -ItemType Directory -Path $deployDir -Force | Out-Null
+
+          & $csc /platform:x64 /r:System.Xml.dll /out:$exeOut $srcFile
+          if ($LASTEXITCODE -ne 0) { Write-Error "Compilation failed."; exit 1 }
+
+          Write-Host ("Compiled  : " + $exeOut)
+
+      # --------------------------------------------------------
+      # 4. Deploy config
+      #    The config must sit next to the exe and be named
+      #    SimpleProvider.exe.config.  The repo may store it
+      #    as SimpleProvider_exe.config (underscore) to avoid
+      #    double-extension issues in some tools -- handle both.
+      # --------------------------------------------------------
+      - name: Deploy config
+        id: config
+        shell: powershell
+        run: |
+          $deployDir  = "C:\SimpleProvider"
+          $destConfig = Join-Path $deployDir "SimpleProvider.exe.config"
+
+          # Prefer the canonical name; fall back to the underscore variant.
+          $candidates = @(
+            (Join-Path $env:GITHUB_WORKSPACE "SimpleProvider.exe.config"),
+            (Join-Path $env:GITHUB_WORKSPACE "SimpleProvider_exe.config")
+          )
+
+          $srcConfig = $null
+          foreach ($c in $candidates) {
+            if (Test-Path $c) { $srcConfig = $c; break }
+          }
+
+          if ($null -eq $srcConfig) {
+            Write-Error "Config file not found -- checked: " + ($candidates -join ", ")
+            exit 1
+          }
+
+          Copy-Item -Path $srcConfig -Destination $destConfig -Force
+          Write-Host ("Config source      : " + $srcConfig)
+          Write-Host ("Config deployed to : " + $destConfig)
+
+      # --------------------------------------------------------
+      # 5. Start provider in the background
+      #    The exe blocks on Console.ReadLine(), so it is
+      #    launched via Start-Process with stdout/stderr
+      #    redirected to files.  The PID is saved for cleanup.
+      # --------------------------------------------------------
+      - name: Start provider
+        id: start
+        shell: powershell
+        run: |
+          $virtRoot = "${{ inputs.virt_root }}"
+
+          # Clear any stale virtroot -- ProjFS cannot stamp a non-empty directory.
+          if (Test-Path $virtRoot) {
+            cmd /c rmdir /s /q $virtRoot
+            Write-Host ("Cleared stale virt root: " + $virtRoot)
+          }
+
+          $exePath  = "C:\SimpleProvider\SimpleProvider.exe"
+          $stdOut   = "C:\SimpleProvider\stdout.txt"
+          $stdErr   = "C:\SimpleProvider\stderr.txt"
+
+          $proc = Start-Process `
+                    -FilePath      $exePath `
+                    -ArgumentList  ("--virtroot " + $virtRoot + " --syntheticonly") `
+                    -WorkingDirectory "C:\SimpleProvider" `
+                    -RedirectStandardOutput $stdOut `
+                    -RedirectStandardError  $stdErr `
+                    -PassThru
+
+          $proc.Id | Out-File "C:\SimpleProvider\pid.txt" -Encoding ASCII
+          Write-Host ("Provider launched -- PID: " + $proc.Id)
+
+          # Poll stdout until "Provider running" appears (up to 30s).
+          $deadline = (Get-Date).AddSeconds(30)
+          $running  = $false
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 500
+            if (Test-Path $stdOut) {
+              $out = Get-Content $stdOut -Raw -ErrorAction SilentlyContinue
+              if ($out -match "Provider running") { $running = $true; break }
+            }
+          }
+
+          Write-Host "--- Provider stdout ---"
+          Get-Content $stdOut -ErrorAction SilentlyContinue
+          if (Test-Path $stdErr) {
+            $err = Get-Content $stdErr -Raw -ErrorAction SilentlyContinue
+            if ($err -and $err.Trim()) {
+              Write-Host "--- Provider stderr ---"
+              Write-Host $err
+            }
+          }
+
+          if (-not $running) {
+            Write-Error "Provider did not report 'Provider running' within 30s."
+            exit 1
+          }
+          Write-Host "Provider is running."
+
+      # --------------------------------------------------------
+      # 6. Smoke test
+      #    Confirms the virt root is visible, files enumerate,
+      #    at least one file is readable, and the provider is
+      #    still alive after file access.
+      # --------------------------------------------------------
+      - name: Smoke test
+        id: smoke
+        shell: powershell
+        run: |
+          $virtRoot = "${{ inputs.virt_root }}"
+
+          # Virt root must exist
+          if (-not (Test-Path $virtRoot)) {
+            Write-Error ("Virt root not visible: " + $virtRoot)
+            exit 1
+          }
+
+          # Top-level entries -- retry for up to 15s.
+          # PrjStartVirtualizing completes and "Provider running" is printed before
+          # Windows fully registers the virtual root as enumerable, so the first
+          # Get-ChildItem can legitimately return 0 entries.
+          $entries  = @()
+          $deadline = (Get-Date).AddSeconds(15)
+          while ((Get-Date) -lt $deadline) {
+            $entries = @(Get-ChildItem -Path $virtRoot -ErrorAction SilentlyContinue)
+            if ($entries.Count -gt 0) { break }
+            Start-Sleep -Seconds 2
+          }
+
+          Write-Host ("Top-level entries: " + $entries.Count)
+          $entries | ForEach-Object { Write-Host ("  " + $_.Name) }
+
+          if ($entries.Count -eq 0) {
+            Write-Error "No entries projected after 15s -- check that the config loaded correctly in the Start provider step."
+            exit 1
+          }
+
+          # Read the first projected file
+          $file = Get-ChildItem -Path $virtRoot -File -Recurse -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+          if (-not $file) {
+            Write-Error "No projected files found under virt root."
+            exit 1
+          }
+
+          Write-Host ("Reading: " + $file.FullName)
+          $content = Get-Content -Path $file.FullName -Raw -ErrorAction Stop
+          Write-Host ("Bytes read: " + $content.Length)
+          Write-Host $content
+
+          # Provider must still be alive after the file read
+          $procId  = [int](Get-Content "C:\SimpleProvider\pid.txt")
+          $process = Get-Process -Id $procId -ErrorAction SilentlyContinue
+          if (-not $process -or $process.HasExited) {
+            Write-Error "Provider exited after file access -- check stdout/stderr below."
+            exit 1
+          }
+
+          Write-Host "Provider still running after file access."
+          Write-Host "Smoke test passed."
+
+      # --------------------------------------------------------
+      # 7. Stop provider and dump final logs
+      #    Runs even when earlier steps fail.
+      # --------------------------------------------------------
+      - name: Stop provider and dump logs
+        if: always()
+        shell: powershell
+        run: |
+          $pidFile = "C:\SimpleProvider\pid.txt"
+          if (Test-Path $pidFile) {
+            $procId = [int](Get-Content $pidFile)
+            Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+            Write-Host ("Stopped provider PID: " + $procId)
+          }
+
+          Write-Host "--- stdout ---"
+          Get-Content "C:\SimpleProvider\stdout.txt" -ErrorAction SilentlyContinue
+          Write-Host "--- stderr ---"
+          Get-Content "C:\SimpleProvider\stderr.txt" -ErrorAction SilentlyContinue
+
+      # --------------------------------------------------------
+      # 8. Create GitHub Issue with the test result
+      #    Only runs when the create_issue input is checked.
+      #    Runs regardless of whether the test passed or failed
+      #    so failures are always reported when requested.
+      # --------------------------------------------------------
+      - name: Create issue
+        if: always() && inputs.create_issue == 'true'
+        shell: powershell
+        env:
+          GH_TOKEN:       ${{ secrets.GITHUB_TOKEN }}
+          REPO:           ${{ github.repository }}
+          RUN_ID:         ${{ github.run_id }}
+          RUN_NUMBER:     ${{ github.run_number }}
+          SERVER_URL:     ${{ github.server_url }}
+          ACTOR:          ${{ github.actor }}
+          REF_NAME:       ${{ github.ref_name }}
+          VIRT_ROOT:      ${{ inputs.virt_root }}
+          JOB_STATUS:     ${{ job.status }}
+          OUTCOME_PROJFS: ${{ steps.projfs.outcome }}
+          OUTCOME_COMPILE:${{ steps.compile.outcome }}
+          OUTCOME_CONFIG: ${{ steps.config.outcome }}
+          OUTCOME_START:  ${{ steps.start.outcome }}
+          OUTCOME_SMOKE:  ${{ steps.smoke.outcome }}
+        run: |
+          function Get-Emoji($o) {
+            switch ($o) {
+              "success"   { return "✅" }
+              "failure"   { return "❌" }
+              "skipped"   { return "⏭️" }
+              "cancelled" { return "⚠️" }
+              default     { return "❓" }
+            }
+          }
+
+          $passed    = $env:JOB_STATUS -eq "success"
+          $badge     = if ($passed) { "PASSED ✅" } else { "FAILED ❌" }
+          $runUrl    = $env:SERVER_URL + "/" + $env:REPO + "/actions/runs/" + $env:RUN_ID
+
+          # Collect provider stdout; truncate to keep the issue readable.
+          $providerOut = ""
+          if (Test-Path "C:\SimpleProvider\stdout.txt") {
+            $raw = Get-Content "C:\SimpleProvider\stdout.txt" -Raw -ErrorAction SilentlyContinue
+            if ($raw) {
+              $providerOut = $raw.Trim()
+              if ($providerOut.Length -gt 2000) {
+                $providerOut = $providerOut.Substring(0, 2000) + "`n`n...(truncated -- see full run log)"
+              }
+            }
+          }
+
+          $body = @"
+          ## SimpleProvider Smoke Test -- $badge
+
+          | | |
+          |---|---|
+          | **Run** | [#$($env:RUN_NUMBER)]($runUrl) |
+          | **Triggered by** | $($env:ACTOR) |
+          | **Ref** | $($env:REF_NAME) |
+          | **Virt root** | $($env:VIRT_ROOT) |
+
+          ### Step results
+
+          | Step | Outcome |
+          |---|---|
+          | Enable ProjFS | $(Get-Emoji $env:OUTCOME_PROJFS) $($env:OUTCOME_PROJFS) |
+          | Compile | $(Get-Emoji $env:OUTCOME_COMPILE) $($env:OUTCOME_COMPILE) |
+          | Deploy config | $(Get-Emoji $env:OUTCOME_CONFIG) $($env:OUTCOME_CONFIG) |
+          | Start provider | $(Get-Emoji $env:OUTCOME_START) $($env:OUTCOME_START) |
+          | Smoke test | $(Get-Emoji $env:OUTCOME_SMOKE) $($env:OUTCOME_SMOKE) |
+
+          ### Provider output
+          ``````
+          $providerOut
+          ``````
+          "@
+
+          # De-indent the here-string (PowerShell indents with the closing marker).
+          $body = ($body -split "`n" | ForEach-Object { $_.TrimStart() }) -join "`n"
+
+          $title   = "Smoke test " + $badge + " -- run #" + $env:RUN_NUMBER
+          $payload = @{ title = $title; body = $body } | ConvertTo-Json -Depth 3
+
+          $response = Invoke-RestMethod `
+            -Uri         ("https://api.github.com/repos/" + $env:REPO + "/issues") `
+            -Method      Post `
+            -Headers     @{
+              Authorization        = "Bearer " + $env:GH_TOKEN
+              Accept               = "application/vnd.github+json"
+              "X-GitHub-Api-Version" = "2022-11-28"
+            } `
+            -Body        $payload `
+            -ContentType "application/json"
+
+          Write-Host ("Issue created: " + $response.html_url)
